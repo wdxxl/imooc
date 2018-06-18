@@ -7,6 +7,10 @@ import (
 	"os"
 	"strings"
 	"time"
+	"regexp"
+	"log"
+	"strconv"
+	"net/url"
 )
 
 type Reader interface {
@@ -14,7 +18,7 @@ type Reader interface {
 }
 
 type Writer interface {
-	Write(wc chan string)
+	Write(wc chan *Message)
 }
 
 type ReadFromFile struct {
@@ -42,7 +46,7 @@ func (r *ReadFromFile) Read(rc chan []byte) {
 		} else if err != nil {
 			panic(fmt.Sprintf("ReadBytes error %s", err.Error()))
 		}
-		rc <- line[:len(line) - 1]
+		rc <- line[:len(line)-1]
 	}
 
 }
@@ -51,24 +55,74 @@ type WriteToInfluxDB struct {
 	influxDBDsn string // influx data source
 }
 
-func (w *WriteToInfluxDB) Write(wc chan string) {
+func (w *WriteToInfluxDB) Write(wc chan *Message) {
 	// 写入模块
-	for value:= range wc {
+	for value := range wc {
 		fmt.Println(value)
 	}
 }
 
 type LogProcess struct {
 	rc    chan []byte
-	wc    chan string
+	wc    chan *Message
 	read  Reader
 	write Writer
 }
 
+type Message struct {
+	TimeLocal                    time.Time
+	BytesSent                    int
+	Path, Method, Scheme, Status string
+	UpstreamTime, RequestTime    float64
+}
+
 func (l *LogProcess) Process() {
 	// 解析模块
+	/**
+	172.0.0.12 - - [04/Mar/2018:13:49:52 +0000] http "GET /foo?query=t HTTP/1.0" 200 2133 "-" "KeepAliveClient" "-" 1.005 1.854
+	*/
+
+	r := regexp.MustCompile(`([\d\.]+)\s+([^ \[]+)\s+([^ \[]+)\s+\[([^\]]+)\]\s+([a-z]+)\s+\"([^"]+)\"\s+(\d{3})\s+(\d+)\s+\"([^"]+)\"\s+\"(.*?)\"\s+\"([\d\.-]+)\"\s+([\d\.-]+)\s+([\d\.-]+)`)
+
+	loc,_ :=time.LoadLocation("Asia/Shanghai")
 	for value := range l.rc {
-		l.wc <- strings.ToUpper(string(value))
+		ret := r.FindStringSubmatch(string(value))
+		if len(ret) != 14 {
+			log.Println("FindStringSubmatch fail:", string(value))
+			continue
+		}
+		message:=&Message{}
+		t, err := time.ParseInLocation("02/Jan/2006:15:04:05 +0000",ret[4],loc)
+		if err!=nil {
+			log.Println("ParseInLocation fail:", err.Error(), ret[4])
+		}
+		message.TimeLocal = t
+
+		byteSent,_ :=strconv.Atoi(ret[8])
+		message.BytesSent = byteSent
+
+		// GET /foo?query=t HTTP/1.0
+		reqSli := strings.Split(ret[6]," ")
+		if len(reqSli) != 3 {
+			log.Println("string.split fail:", ret[6])
+		}
+		message.Method = reqSli[0]
+
+		u, err:=url.Parse(reqSli[1])
+		if err!=nil{
+			log.Println("url parse fail:",err)
+		}
+		message.Path = u.Path
+
+		message.Scheme = ret[5]
+		message.Status = ret[7]
+
+		upstreamTime, _:= strconv.ParseFloat(ret[12], 64)
+		requestTime,_:=strconv.ParseFloat(ret[13], 64)
+		message.RequestTime = requestTime
+		message.UpstreamTime = upstreamTime
+
+		l.wc <- message
 	}
 }
 
@@ -77,7 +131,7 @@ func main() {
 	w := &WriteToInfluxDB{influxDBDsn: "username&password..."}
 	lp := &LogProcess{
 		make(chan []byte),
-		make(chan string),
+		make(chan *Message),
 		r,
 		w,
 	}

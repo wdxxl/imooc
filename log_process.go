@@ -4,16 +4,18 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
+	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
-	"regexp"
-	"log"
-	"strconv"
-	"net/url"
 
-	"github.com/influxdata/influxdb/client/v2"
+	"encoding/json"
 	"flag"
+	"github.com/influxdata/influxdb/client/v2"
+	"net/http"
 )
 
 type Reader interface {
@@ -49,6 +51,7 @@ func (r *ReadFromFile) Read(rc chan []byte) {
 		} else if err != nil {
 			panic(fmt.Sprintf("ReadBytes error %s", err.Error()))
 		}
+		TypeMonitorChan <- TypeHeadLine
 		rc <- line[:len(line)-1]
 	}
 
@@ -60,7 +63,7 @@ type WriteToInfluxDB struct {
 
 func (w *WriteToInfluxDB) Write(wc chan *Message) {
 	// 写入模块
-	infSli :=strings.Split(w.influxDBDsn, "@")
+	infSli := strings.Split(w.influxDBDsn, "@")
 	// Create a new HTTPClient
 	c, err := client.NewHTTPClient(client.HTTPConfig{
 		Addr:     infSli[0],
@@ -84,10 +87,10 @@ func (w *WriteToInfluxDB) Write(wc chan *Message) {
 
 		// Create a point and add to batch
 		// Tags: Path, Method, Scheme, Status
-		tags := map[string]string{"Path": value.Method, "Method":value.Method, "Scheme":value.Scheme, "Status": value.Status}
+		tags := map[string]string{"Path": value.Method, "Method": value.Method, "Scheme": value.Scheme, "Status": value.Status}
 		// Fields: UpstramTime, RequestTime, ByteSent
 		fields := map[string]interface{}{
-			"UpstramTime":   value.UpstreamTime,
+			"UpstramTime": value.UpstreamTime,
 			"RequestTime": value.RequestTime,
 			"BytesSent":   value.BytesSent,
 		}
@@ -124,6 +127,69 @@ type Message struct {
 	UpstreamTime, RequestTime    float64
 }
 
+// 系统状态监控
+type SystemInfo struct {
+	HandleLine   int     `json:handleLine`   //总处理日志行数
+	Tps          float64 `json:tps`          // 系统吞吐量
+	ReadChanLen  int     `json:readChanLen`  // read channel 长度
+	WriteChanLen int     `json:writeChanLen` // write channel 长度
+	RunTime      string  `json:runTime`      // 运行总时间
+	ErrNum       int     `json:errNum`       // 错误数
+}
+
+const (
+	TypeHeadLine = 0
+	TypeErrNum   = 1
+)
+
+var TypeMonitorChan = make(chan int, 200)
+
+type Monitor struct {
+	stratTime time.Time
+	data      SystemInfo
+	tpsSli    []int
+}
+
+func (m *Monitor) start(lp *LogProcess) {
+
+	go func() {
+		for n := range TypeMonitorChan {
+			switch n {
+			case TypeErrNum:
+				m.data.ErrNum += 1
+			case TypeHeadLine:
+				m.data.HandleLine += 1
+			}
+		}
+	}()
+
+	//定时器
+	ticker := time.NewTicker(time.Second * 5)
+	go func() {
+		for {
+			<-ticker.C
+			m.tpsSli = append(m.tpsSli, m.data.HandleLine)
+			if len(m.tpsSli) > 2 {
+				m.tpsSli = m.tpsSli[1:]
+			}
+		}
+	}()
+
+	http.HandleFunc("/monitor", func(writer http.ResponseWriter, request *http.Request) {
+		m.data.RunTime = time.Now().Sub(m.stratTime).String()
+		m.data.ReadChanLen = len(lp.rc)
+		m.data.WriteChanLen = len(lp.wc)
+
+		if len(m.tpsSli) >=2 {
+			m.data.Tps = float64(m.tpsSli[1]-m.tpsSli[0]) / 5
+		}
+
+		ret, _ := json.MarshalIndent(m.data, "", "\t")
+		io.WriteString(writer, string(ret))
+	})
+	http.ListenAndServe(":9193", nil)
+}
+
 func (l *LogProcess) Process() {
 	// 解析模块
 	/**
@@ -132,41 +198,48 @@ func (l *LogProcess) Process() {
 
 	r := regexp.MustCompile(`([\d\.]+)\s+([^ \[]+)\s+([^ \[]+)\s+\[([^\]]+)\]\s+([a-z]+)\s+\"([^"]+)\"\s+(\d{3})\s+(\d+)\s+\"([^"]+)\"\s+\"(.*?)\"\s+\"([\d\.-]+)\"\s+([\d\.-]+)\s+([\d\.-]+)`)
 
-	loc,_ :=time.LoadLocation("Asia/Shanghai")
+	loc, _ := time.LoadLocation("Asia/Shanghai")
 	for value := range l.rc {
 		ret := r.FindStringSubmatch(string(value))
 		if len(ret) != 14 {
+			TypeMonitorChan <- TypeErrNum
 			log.Println("FindStringSubmatch fail:", string(value))
 			continue
 		}
-		message:=&Message{}
-		t, err := time.ParseInLocation("02/Jan/2006:15:04:05 +0000",ret[4],loc)
-		if err!=nil {
+		message := &Message{}
+		t, err := time.ParseInLocation("02/Jan/2006:15:04:05 +0000", ret[4], loc)
+		if err != nil {
+			TypeMonitorChan <- TypeErrNum
 			log.Println("ParseInLocation fail:", err.Error(), ret[4])
+			continue
 		}
 		message.TimeLocal = t
 
-		byteSent,_ :=strconv.Atoi(ret[8])
+		byteSent, _ := strconv.Atoi(ret[8])
 		message.BytesSent = byteSent
 
 		// GET /foo?query=t HTTP/1.0
-		reqSli := strings.Split(ret[6]," ")
+		reqSli := strings.Split(ret[6], " ")
 		if len(reqSli) != 3 {
+			TypeMonitorChan <- TypeErrNum
 			log.Println("string.split fail:", ret[6])
+			continue
 		}
 		message.Method = reqSli[0]
 
-		u, err:=url.Parse(reqSli[1])
-		if err!=nil{
-			log.Println("url parse fail:",err)
+		u, err := url.Parse(reqSli[1])
+		if err != nil {
+			TypeMonitorChan <- TypeErrNum
+			log.Println("url parse fail:", err)
+			continue
 		}
 		message.Path = u.Path
 
 		message.Scheme = ret[5]
 		message.Status = ret[7]
 
-		upstreamTime, _:= strconv.ParseFloat(ret[12], 64)
-		requestTime,_:=strconv.ParseFloat(ret[13], 64)
+		upstreamTime, _ := strconv.ParseFloat(ret[12], 64)
+		requestTime, _ := strconv.ParseFloat(ret[13], 64)
 		message.RequestTime = requestTime
 		message.UpstreamTime = upstreamTime
 
@@ -178,11 +251,11 @@ func (l *LogProcess) Process() {
 func main() {
 	var path, influxDsn string
 	flag.StringVar(&path, "path", "./access.log", "read file path")
-	flag.StringVar(&influxDsn, "influxDsn",  "http://127.0.0.1:8086@imooc@imoocpass@imooc@s", "influxDsn path")
+	flag.StringVar(&influxDsn, "influxDsn", "http://127.0.0.1:8086@imooc@imoocpass@imooc@s", "influxDsn path")
 	flag.Parse()
 
 	r := &ReadFromFile{path: path}
-	w := &WriteToInfluxDB{influxDBDsn:influxDsn}
+	w := &WriteToInfluxDB{influxDBDsn: influxDsn}
 	lp := &LogProcess{
 		make(chan []byte),
 		make(chan *Message),
@@ -193,5 +266,9 @@ func main() {
 	go lp.Process()
 	go lp.write.Write(lp.wc)
 
-	time.Sleep(30 * time.Second)
+	m := &Monitor{
+		stratTime: time.Now(),
+		data:      SystemInfo{},
+	}
+	m.start(lp)
 }

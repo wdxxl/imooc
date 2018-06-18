@@ -257,13 +257,17 @@ func main() {
 	r := &ReadFromFile{path: path}
 	w := &WriteToInfluxDB{influxDBDsn: influxDsn}
 	lp := &LogProcess{
-		make(chan []byte),
-		make(chan *Message),
+		make(chan []byte, 200),
+		make(chan *Message,200),
 		r,
 		w,
 	}
-	go lp.read.Read(lp.rc)
+	go lp.read.Read(lp.rc)		// 读取比较快
+	go lp.Process()				// 处理需要正则比较慢一点
 	go lp.Process()
+	go lp.write.Write(lp.wc)	// 写入需要http 走数据库，更慢一点
+	go lp.write.Write(lp.wc)
+	go lp.write.Write(lp.wc)
 	go lp.write.Write(lp.wc)
 
 	m := &Monitor{

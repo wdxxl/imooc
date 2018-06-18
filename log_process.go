@@ -11,6 +11,9 @@ import (
 	"log"
 	"strconv"
 	"net/url"
+
+	"github.com/influxdata/influxdb/client/v2"
+	"flag"
 )
 
 type Reader interface {
@@ -57,8 +60,53 @@ type WriteToInfluxDB struct {
 
 func (w *WriteToInfluxDB) Write(wc chan *Message) {
 	// 写入模块
+	infSli :=strings.Split(w.influxDBDsn, "@")
+	// Create a new HTTPClient
+	c, err := client.NewHTTPClient(client.HTTPConfig{
+		Addr:     infSli[0],
+		Username: infSli[1],
+		Password: infSli[2],
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer c.Close()
+
 	for value := range wc {
-		fmt.Println(value)
+		// Create a new point batch
+		bp, err := client.NewBatchPoints(client.BatchPointsConfig{
+			Database:  infSli[3],
+			Precision: infSli[4],
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// Create a point and add to batch
+		// Tags: Path, Method, Scheme, Status
+		tags := map[string]string{"Path": value.Method, "Method":value.Method, "Scheme":value.Scheme, "Status": value.Status}
+		// Fields: UpstramTime, RequestTime, ByteSent
+		fields := map[string]interface{}{
+			"UpstramTime":   value.UpstreamTime,
+			"RequestTime": value.RequestTime,
+			"BytesSent":   value.BytesSent,
+		}
+
+		pt, err := client.NewPoint("nginx_log", tags, fields, value.TimeLocal)
+		if err != nil {
+			log.Fatal(err)
+		}
+		bp.AddPoint(pt)
+
+		// Write the batch
+		if err := c.Write(bp); err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	// Close client resources
+	if err := c.Close(); err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -126,9 +174,15 @@ func (l *LogProcess) Process() {
 	}
 }
 
+// go run log_process.go -path "./access.log" -influxDsn "http://127.0.0.1:8086@imooc@imoocpass@imooc@s"
 func main() {
-	r := &ReadFromFile{path: "./access.log"}
-	w := &WriteToInfluxDB{influxDBDsn: "username&password..."}
+	var path, influxDsn string
+	flag.StringVar(&path, "path", "./access.log", "read file path")
+	flag.StringVar(&influxDsn, "influxDsn",  "http://127.0.0.1:8086@imooc@imoocpass@imooc@s", "influxDsn path")
+	flag.Parse()
+
+	r := &ReadFromFile{path: path}
+	w := &WriteToInfluxDB{influxDBDsn:influxDsn}
 	lp := &LogProcess{
 		make(chan []byte),
 		make(chan *Message),
